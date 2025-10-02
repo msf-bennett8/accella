@@ -725,7 +725,7 @@ const SessionScheduleScreen = ({ navigation, route }) => {
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
               <View style={{ flex: 1 }}>
                 {/* Line 1: Academy/Team/Individual • Sport */}
-                <Text style={[TEXT_STYLES.caption, { 
+                <Text style={[textStyles.caption, { 
                   color: colors.textSecondary,
                   textTransform: 'uppercase',
                   fontSize: 10,
@@ -738,7 +738,7 @@ const SessionScheduleScreen = ({ navigation, route }) => {
                 </Text>
                 
                 {/* Line 2: Plan Name */}
-                <Text style={[TEXT_STYLES.h3, { 
+                <Text style={[textStyles.h3, { 
                   fontSize: 18,
                   fontWeight: 'bold',
                   marginBottom: 2
@@ -747,7 +747,7 @@ const SessionScheduleScreen = ({ navigation, route }) => {
                 </Text>
                 
                 {/* Line 3: Week + Day */}
-                <Text style={[TEXT_STYLES.body2, { 
+                <Text style={[textStyles.body2, { 
                   color: colors.textSecondary,
                   marginBottom: 2
                 }]}>
@@ -758,13 +758,13 @@ const SessionScheduleScreen = ({ navigation, route }) => {
                 <View style={styles.sessionMetrics}>
                   <View style={styles.metricItem}>
                     <Icon name="schedule" size={16} color={colors.textSecondary} />
-                    <Text style={[TEXT_STYLES.caption, { marginLeft: 4 }]}>
+                    <Text style={[textStyles.caption, { marginLeft: 4 }]}>
                       {session.trainingTime || `${session.time} (${session.duration}min)`}
                     </Text>
                   </View>
                   <View style={styles.metricItem}>
                     <Icon name="location-on" size={16} color={colors.textSecondary} />
-                    <Text style={[TEXT_STYLES.caption, { marginLeft: 4 }]}>
+                    <Text style={[textStyles.caption, { marginLeft: 4 }]}>
                       {session.location || 'Training Field'}
                     </Text>
                   </View>
