@@ -298,3 +298,13 @@ react-native-debugger
 .env
 .env.local
 .env.production
+google-services.json
+GoogleService-Info.plist
+ios/GoogleService-Info.plist
+android/app/google-services.json
+
+# Google Services (Firebase API keys)
+google-services.json
+GoogleService-Info.plist
+ios/GoogleService-Info.plist
+android/app/google-services.json
