@@ -4,6 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import PlatformUtils from '../utils/PlatformUtils';
 import PDFProcessor from './PDFProcessor';
 import AIService from './AIService';
+import CloudinaryService from './CloudinaryService';
 
 // Safe module variables - initialized to null
 let DocumentPicker = null;
@@ -655,7 +656,83 @@ async repairDocumentIntegrity(documentId) {
     }
   }
 
-  // Web document storage
+  // Cloudinary
+
+  async storeDocumentWithCloudinary(file, userId) {
+  try {
+    console.log('📤 Storing document with Cloudinary...');
+
+    // Validate file
+    const validation = CloudinaryService.validateFile(file.size, file.name);
+    if (!validation.valid) {
+      throw new Error(validation.error);
+    }
+
+    // Upload to Cloudinary
+    const cloudinaryResult = await CloudinaryService.uploadDocument(
+      file.uri,
+      file.name,
+      userId
+    );
+
+    // Create document metadata for Firestore
+    const documentData = {
+      id: `doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      originalName: file.name,
+      size: file.size,
+      type: file.type,
+      uploadedAt: new Date().toISOString(),
+      userId: userId,
+      
+      // Cloudinary data
+      cloudinaryUrl: cloudinaryResult.url,
+      cloudinaryPublicId: cloudinaryResult.publicId,
+      cloudinaryFolder: cloudinaryResult.folder,
+      storageProvider: 'cloudinary',
+      
+      // Keep local copy for offline access
+      localPath: file.uri,
+      
+      processed: false,
+      platform: Platform.OS
+    };
+
+    // Store metadata in Firestore
+    await this.saveDocumentMetadata(documentData);
+
+    return {
+      success: true,
+      document: documentData,
+      cloudinaryData: cloudinaryResult
+    };
+
+  } catch (error) {
+    console.error('❌ Cloudinary storage failed:', error);
+    throw error;
+  }
+}
+
+// Helper method to save to Firestore
+async saveDocumentMetadata(documentData) {
+  try {
+    const FirebaseService = (await import('./FirebaseService')).default;
+    
+    if (Platform.OS === 'web') {
+      const { collection, addDoc } = require('firebase/firestore');
+      const { db } = require('../config/firebase.config');
+      await addDoc(collection(db, 'documents'), documentData);
+    } else {
+      const { db } = require('../config/firebase.config');
+      await db.collection('documents').add(documentData);
+    }
+    
+    console.log('✅ Document metadata saved to Firestore');
+  } catch (error) {
+    console.warn('⚠️ Could not save to Firestore, storing locally only');
+  }
+}
+
+
 // Web document storage with file data preservation
 // Fixed _storeDocumentWeb method
 async _storeDocumentWeb(file) {
@@ -1336,32 +1413,37 @@ async storeDocumentWithIntegrityCheck(file) {
   try {
     console.log('Starting document storage with integrity check...');
     
+    // STEP 1: Store locally FIRST (offline-first priority)
     const document = await this.storeDocument(file);
-    console.log('Document stored successfully:', {
-      id: document.id,
-      name: document.originalName,
-      hasWebData: !!document.webFileData
-    });
+    console.log('✅ Local storage completed:', document.id);
     
+    // STEP 2: Run integrity check
     const integrityResult = await this.verifyFileIntegrity(document);
-    console.log('Integrity check completed:', integrityResult.overallStatus);
+    console.log('✅ Integrity check completed:', integrityResult.overallStatus);
     
+    // STEP 3: Update document with integrity info
     document.integrityCheck = {
       timestamp: integrityResult.timestamp,
       status: integrityResult.overallStatus,
       lastChecked: new Date().toISOString()
     };
     
-    await this.updateDocumentMetadata(document);
-    
-    // NEW: Store upload metadata for session setup
-    document.uploadMetadata = {
-      uploadedAt: new Date().toISOString(),
-      needsSessionSetup: true, // Flag for session setup prompt
-      setupCompleted: false
-    };
+    // STEP 4: Initialize Cloudinary sync status
+    document.cloudinarySyncStatus = 'pending';
+    document.cloudinaryBackup = false;
+    document.cloudinaryRetryCount = 0;
     
     await this.updateDocumentMetadata(document);
+    
+    // STEP 5: Try Cloudinary backup (async, non-blocking)
+    console.log('Initiating cloud backup...');
+    this.uploadToCloudinaryAsync(document, file)
+      .then(cloudinaryResult => {
+        console.log('✅ Cloud backup completed:', cloudinaryResult.publicId);
+      })
+      .catch(error => {
+        console.warn('⚠️ Cloud backup failed (document saved locally):', error.message);
+      });
     
     return {
       document,
@@ -1373,7 +1455,233 @@ async storeDocumentWithIntegrityCheck(file) {
   }
 }
 
+// NEW METHOD: Async Cloudinary upload with progress tracking
+async uploadToCloudinaryAsync(document, file) {
+  try {
+    // Check network status first
+    const isOnline = await this.checkNetworkStatus();
+    if (!isOnline) {
+      throw new Error('Device offline - will retry when online');
+    }
+    
+    // Get user ID for folder structure
+    const userInfo = await this.getUserInfo();
+    const userId = userInfo.username || userInfo.firebaseUid || 'anonymous';
+    
+    console.log('☁️ Starting cloud backup for:', document.originalName);
+    
+    // Update status to 'uploading'
+    document.cloudinarySyncStatus = 'uploading';
+    await this.updateDocumentMetadata(document);
+    
+    // Upload to Cloudinary
+    const CloudinaryService = (await import('./CloudinaryService')).default;
+    const cloudinaryResult = await CloudinaryService.uploadDocument(
+      file.uri || file.path,
+      file.name,
+      userId
+    );
+    
+    // Update document with Cloudinary info
+    document.cloudinaryUrl = cloudinaryResult.url;
+    document.cloudinaryPublicId = cloudinaryResult.publicId;
+    document.cloudinaryBackup = true;
+    document.cloudinaryBackupAt = new Date().toISOString();
+    document.cloudinarySyncStatus = 'synced';
+    document.cloudinarySize = cloudinaryResult.size;
+    document.cloudinaryFormat = cloudinaryResult.format;
+    
+    // Clear any previous errors
+    delete document.cloudinaryLastError;
+    
+    // Save updated metadata
+    await this.updateDocumentMetadata(document);
+    
+    console.log('✅ Cloud backup metadata saved');
+    
+    return cloudinaryResult;
+  } catch (error) {
+    console.error('Cloud backup failed:', error.message);
+    
+    // Update document with failure info
+    document.cloudinarySyncStatus = 'failed';
+    document.cloudinaryLastError = error.message;
+    document.cloudinaryRetryCount = (document.cloudinaryRetryCount || 0) + 1;
+    document.cloudinaryLastAttempt = new Date().toISOString();
+    
+    await this.updateDocumentMetadata(document);
+    
+    throw error;
+  }
+}
 
+// NEW METHOD: Check network status
+async checkNetworkStatus() {
+  try {
+    // Try to import OfflineService
+    const OfflineService = (await import('./OfflineService')).default;
+    return OfflineService.isOnline;
+  } catch (error) {
+    // Fallback: assume online
+    console.warn('Could not check network status, assuming online');
+    return true;
+  }
+}
+
+// NEW METHOD: Restore document from Cloudinary
+async restoreFromCloudinary(documentId) {
+  try {
+    const documents = await this.getStoredDocuments();
+    const document = documents.find(doc => doc.id === documentId);
+    
+    if (!document) {
+      throw new Error('Document not found');
+    }
+    
+    if (!document.cloudinaryPublicId) {
+      throw new Error('No cloud backup available for this document');
+    }
+    
+    console.log('📥 Restoring from cloud:', document.cloudinaryPublicId);
+    
+    // Download from Cloudinary
+    const CloudinaryService = (await import('./CloudinaryService')).default;
+    const downloadResult = await CloudinaryService.downloadDocument(
+      document.cloudinaryPublicId
+    );
+    
+    // Restore to local storage based on platform
+    if (PlatformUtils.isWeb()) {
+      document.webFileData = Array.from(new Uint8Array(downloadResult.data));
+      console.log('✅ Restored to web storage');
+    } else if (RNFS) {
+      const base64Data = Buffer.from(downloadResult.data).toString('base64');
+      await RNFS.writeFile(document.localPath, base64Data, 'base64');
+      console.log('✅ Restored to mobile storage');
+    }
+    
+    // Mark as restored
+    document.restoredFromCloudinary = true;
+    document.restoredAt = new Date().toISOString();
+    
+    await this.updateDocumentMetadata(document);
+    
+    return { success: true, document };
+    
+  } catch (error) {
+    console.error('Cloud restore failed:', error);
+    throw PlatformUtils.handlePlatformError(error, 'Cloud Restore');
+  }
+}
+
+// NEW METHOD: Retry failed cloud uploads
+async retryFailedCloudinaryUploads() {
+  try {
+    console.log('🔄 Checking for failed cloud uploads to retry...');
+    
+    const documents = await this.getStoredDocuments();
+    const failedUploads = documents.filter(doc => 
+      doc.cloudinarySyncStatus === 'failed' && 
+      (doc.cloudinaryRetryCount || 0) < 3 // Max 3 retries
+    );
+    
+    if (failedUploads.length === 0) {
+      console.log('No failed uploads to retry');
+      return { 
+        success: true, 
+        message: 'No failed uploads found',
+        retriedCount: 0 
+      };
+    }
+    
+    console.log(`Found ${failedUploads.length} failed uploads to retry`);
+    
+    let successCount = 0;
+    const results = [];
+    
+    for (const doc of failedUploads) {
+      try {
+        console.log(`Retrying upload for: ${doc.originalName}`);
+        
+        // Reconstruct file object for retry
+        const file = {
+          uri: doc.uri,
+          name: doc.originalName,
+          type: doc.type,
+          size: doc.size
+        };
+        
+        await this.uploadToCloudinaryAsync(doc, file);
+        successCount++;
+        
+        results.push({
+          documentId: doc.id,
+          success: true,
+          name: doc.originalName
+        });
+      } catch (error) {
+        console.warn(`Retry failed for ${doc.originalName}:`, error.message);
+        
+        results.push({
+          documentId: doc.id,
+          success: false,
+          name: doc.originalName,
+          error: error.message
+        });
+      }
+    }
+    
+    return {
+      success: true,
+      retriedCount: failedUploads.length,
+      successCount,
+      failedCount: failedUploads.length - successCount,
+      results
+    };
+    
+  } catch (error) {
+    console.error('Error retrying cloud uploads:', error);
+    return { 
+      success: false, 
+      error: error.message 
+    };
+  }
+}
+
+// NEW METHOD: Get cloud sync statistics
+async getCloudSyncStats() {
+  try {
+    const documents = await this.getStoredDocuments();
+    
+    const stats = {
+      total: documents.length,
+      synced: 0,
+      failed: 0,
+      pending: 0,
+      uploading: 0,
+      noBackup: 0
+    };
+    
+    documents.forEach(doc => {
+      if (doc.cloudinarySyncStatus === 'synced') {
+        stats.synced++;
+      } else if (doc.cloudinarySyncStatus === 'failed') {
+        stats.failed++;
+      } else if (doc.cloudinarySyncStatus === 'uploading') {
+        stats.uploading++;
+      } else if (doc.cloudinarySyncStatus === 'pending') {
+        stats.pending++;
+      } else {
+        stats.noBackup++;
+      }
+    });
+    
+    return stats;
+  } catch (error) {
+    console.error('Error getting cloud sync stats:', error);
+    return null;
+  }
+}
 
   // Enhanced text extraction with better error handling
 async extractWordTextUnified(document) {

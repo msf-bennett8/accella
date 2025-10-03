@@ -1,5 +1,6 @@
 //src/services/PDFProcessor.js
 import PlatformUtils from '../utils/PlatformUtils';
+import CloudinaryService from './CloudinaryService';
 
 class PDFProcessor {
   constructor() {
@@ -16,6 +17,80 @@ class PDFProcessor {
     this.initializationPromise = this._performInit();
     return this.initializationPromise;
   }
+
+  async storeDocumentWithCloudinary(file, userId) {
+  try {
+    console.log('📤 Storing document with Cloudinary...');
+
+    // Validate file
+    const validation = CloudinaryService.validateFile(file.size, file.name);
+    if (!validation.valid) {
+      throw new Error(validation.error);
+    }
+
+    // Upload to Cloudinary
+    const cloudinaryResult = await CloudinaryService.uploadDocument(
+      file.uri,
+      file.name,
+      userId
+    );
+
+    // Create document metadata for Firestore
+    const documentData = {
+      id: `doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      originalName: file.name,
+      size: file.size,
+      type: file.type,
+      uploadedAt: new Date().toISOString(),
+      userId: userId,
+      
+      // Cloudinary data
+      cloudinaryUrl: cloudinaryResult.url,
+      cloudinaryPublicId: cloudinaryResult.publicId,
+      cloudinaryFolder: cloudinaryResult.folder,
+      storageProvider: 'cloudinary',
+      
+      // Keep local copy for offline access
+      localPath: file.uri,
+      
+      processed: false,
+      platform: Platform.OS
+    };
+
+    // Store metadata in Firestore
+    await this.saveDocumentMetadata(documentData);
+
+    return {
+      success: true,
+      document: documentData,
+      cloudinaryData: cloudinaryResult
+    };
+
+  } catch (error) {
+    console.error('❌ Cloudinary storage failed:', error);
+    throw error;
+  }
+}
+
+// Helper method to save to Firestore
+async saveDocumentMetadata(documentData) {
+  try {
+    const FirebaseService = (await import('./FirebaseService')).default;
+    
+    if (Platform.OS === 'web') {
+      const { collection, addDoc } = require('firebase/firestore');
+      const { db } = require('../config/firebase.config');
+      await addDoc(collection(db, 'documents'), documentData);
+    } else {
+      const { db } = require('../config/firebase.config');
+      await db.collection('documents').add(documentData);
+    }
+    
+    console.log('✅ Document metadata saved to Firestore');
+  } catch (error) {
+    console.warn('⚠️ Could not save to Firestore, storing locally only');
+  }
+}
 
   async _performInit() {
     if (this.initialized) return;

@@ -50,6 +50,7 @@
     "@tensorflow/tfjs-backend-webgl": "^4.22.0",
     "@tensorflow/tfjs-core": "^4.22.0",
     "axios": "^1.12.2",
+    "cloudinary-react-native": "^1.2.1",
     "compromise": "^14.14.4",
     "crypto-js": "^4.2.0",
     "expo": "^53.0.23",

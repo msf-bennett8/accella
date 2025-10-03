@@ -106,7 +106,8 @@ const CoachingPlanUploadScreen = ({ navigation }) => {
   const [showDocuments, setShowDocuments] = useState(true);
   const [clearedDocuments, setClearedDocuments] = useState(new Set());
   const [allStoredDocuments, setAllStoredDocuments] = useState([]);
-
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('idle');
+  const [cloudSyncProgress, setCloudSyncProgress] = useState(0);
   
   useEffect(() => {
     initializePlatform();
@@ -215,6 +216,18 @@ const handleDocumentUpload = async () => {
 
     setUploadProgress(0.9);
     setUploadStatus('Structure analysis complete');
+    
+    // NEW: Show cloud backup status
+    if (result.document.cloudinarySyncStatus === 'uploading') {
+      setCloudSyncStatus('syncing');
+      setUploadStatus('Uploading complete! Cloud backup in progress...');
+    } else if (result.document.cloudinarySyncStatus === 'synced') {
+      setCloudSyncStatus('completed');
+      setUploadStatus('Upload and cloud backup completed!');
+    } else if (result.document.cloudinarySyncStatus === 'failed') {
+      setCloudSyncStatus('failed');
+      setUploadStatus('Upload complete. Cloud backup will retry automatically.');
+    }
 
     let academyPreview = null;
     try {
@@ -635,6 +648,19 @@ const handleRestoreDocuments = () => {
                       )}
                       <IntegrityStatusChip document={doc} />
                     </View>
+                    <View style={styles.documentMetadata}>
+                      {doc.platform && (
+                        <Text style={styles.platformTag}>
+                          {doc.platform === 'web' ? 'Web' : 'Mobile'}
+                        </Text>
+                      )}
+                      <IntegrityStatusChip document={doc} />
+                      
+                      {/* NEW: Cloud sync status indicator */}
+                      {doc.cloudinarySyncStatus && (
+                        <CloudSyncStatusChip document={doc} />
+                      )}
+                    </View>
                     {doc.integrityCheck && (
                       <Text style={styles.integrityDate}>
                         Last checked: {formatDate(doc.integrityCheck.timestamp)}
@@ -705,6 +731,95 @@ const handleRestoreDocuments = () => {
     </ScrollView>
   );
 };
+
+// NEW: Cloud Sync Status Chip Component
+  const CloudSyncStatusChip = ({ document }) => {
+    const getCloudStatus = () => {
+      if (!document.cloudinarySyncStatus || document.cloudinarySyncStatus === 'pending') {
+        return { 
+          color: '#9E9E9E', 
+          text: 'Pending', 
+          icon: 'cloud-queue',
+          action: null
+        };
+      }
+      
+      switch (document.cloudinarySyncStatus) {
+        case 'synced':
+          return { 
+            color: '#4CAF50', 
+            text: 'Cloud Backup', 
+            icon: 'cloud-done',
+            action: null
+          };
+        case 'uploading':
+          return { 
+            color: '#2196F3', 
+            text: 'Uploading...', 
+            icon: 'cloud-upload',
+            action: null
+          };
+        case 'failed':
+          return { 
+            color: '#F44336', 
+            text: 'Backup Failed', 
+            icon: 'cloud-off',
+            action: 'retry'
+          };
+        default:
+          return { 
+            color: '#9E9E9E', 
+            text: 'No Backup', 
+            icon: 'cloud-off',
+            action: null
+          };
+      }
+    };
+    
+    const status = getCloudStatus();
+    
+    const handleRetryUpload = async () => {
+      try {
+        setUploadStatus('Retrying cloud backup...');
+        const result = await DocumentProcessor.retryFailedCloudinaryUploads();
+        
+        if (result.success && result.successCount > 0) {
+          await loadDocuments();
+          setUploadStatus('Cloud backup retry successful!');
+          setTimeout(() => setUploadStatus(''), 2000);
+        } else {
+          setUploadStatus('Cloud backup retry failed. Will retry automatically when online.');
+          setTimeout(() => setUploadStatus(''), 3000);
+        }
+      } catch (error) {
+        console.error('Retry failed:', error);
+      }
+    };
+    
+    return (
+      <View style={styles.cloudSyncContainer}>
+        <Chip
+          icon={() => <SafeIcon name={status.icon} size={14} color="white" />}
+          style={[styles.cloudSyncChip, { backgroundColor: status.color }]}
+          textStyle={styles.cloudSyncChipText}
+          compact
+        >
+          {status.text}
+        </Chip>
+        {status.action === 'retry' && (
+          <Button
+            mode="text"
+            compact
+            onPress={handleRetryUpload}
+            style={styles.retryButton}
+            labelStyle={styles.retryButtonText}
+          >
+            Retry
+          </Button>
+        )}
+      </View>
+    );
+  };
 
 const styles = StyleSheet.create({
   container: {
@@ -920,6 +1035,29 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: COLORS.secondary,
     marginTop: SPACING.xs / 2,
+  },
+  cloudSyncContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.xs,
+    marginTop: SPACING.xs / 2,
+  },
+  cloudSyncChip: {
+    height: 24,
+  },
+  cloudSyncChipText: {
+    color: 'white',
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
+  retryButton: {
+    marginLeft: SPACING.xs,
+    height: 24,
+  },
+  retryButtonText: {
+    fontSize: 10,
+    color: COLORS.primary,
+    fontWeight: 'bold',
   },
   restoreContainer: {
     alignItems: 'center',

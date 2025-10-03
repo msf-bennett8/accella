@@ -294,6 +294,18 @@ class OfflineService {
       
       this.notifyListeners('syncCompleted', results);
       
+      // NEW: Also retry failed Cloudinary uploads when coming online
+      try {
+        const DocumentProcessor = (await import('./DocumentProcessor')).default;
+        const cloudRetryResult = await DocumentProcessor.retryFailedCloudinaryUploads();
+        
+        if (cloudRetryResult.success && cloudRetryResult.successCount > 0) {
+          console.log(`✅ Retried ${cloudRetryResult.successCount} cloud backups successfully`);
+        }
+      } catch (cloudError) {
+        console.warn('Cloud backup retry failed:', cloudError.message);
+      }
+      
       return results;
     } catch (error) {
       console.error('Error during sync:', error);
