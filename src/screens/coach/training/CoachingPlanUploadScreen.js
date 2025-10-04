@@ -10,7 +10,9 @@ import {
   TouchableOpacity,
 } from 'react-native';
 import { Card, Button, ProgressBar, Surface, IconButton, Chip } from 'react-native-paper';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import DocumentProcessor from '../../../services/DocumentProcessor';
+import PlatformStorageStrategy from '../../../services/PlatformStorageStrategy';
 import PlatformUtils from '../../../utils/PlatformUtils';
 import SessionSetupModal from '../../../components/settings/SessionSetupModal';
 import SessionManager from '../../../utils/sessionManager';
@@ -119,6 +121,32 @@ const CoachingPlanUploadScreen = ({ navigation }) => {
     }
   }, [clearedDocuments, platformReady]);
 
+  const getUserInfo = async () => {
+    try {
+      const storageKeys = ['authenticatedUser', 'user_data', 'user_profile'];
+      
+      for (const key of storageKeys) {
+        try {
+          const userInfo = await AsyncStorage.getItem(key);
+          if (userInfo) {
+            const parsed = JSON.parse(userInfo);
+            return {
+              userId: parsed.firebaseUid || parsed.username || 'anonymous',
+              username: parsed.username,
+              firebaseUid: parsed.firebaseUid
+            };
+          }
+        } catch (error) {
+          continue;
+        }
+      }
+    } catch (error) {
+      console.warn('Could not get user info:', error);
+    }
+    
+    return { userId: 'anonymous', username: null, firebaseUid: null };
+  };
+
   const initializePlatform = async () => {
     try {
       await PlatformUtils.initializePlatform();
@@ -185,7 +213,7 @@ const handleDocumentUpload = async () => {
     }
 
     setUploadProgress(0.3);
-    setUploadStatus('Analyzing document structure...');
+    setUploadStatus('Validating file...');
 
     const validation = DocumentProcessor.validateFileForPlatform(file);
     
@@ -195,43 +223,83 @@ const handleDocumentUpload = async () => {
       return;
     }
 
-    setUploadProgress(0.5);
-    setUploadStatus('Storing file and analyzing structure...');
+    setUploadProgress(0.4);
+    setUploadStatus('Getting user information...');
 
-    const result = await DocumentProcessor.storeDocumentWithIntegrityCheck(file);
+    // Get user ID for cloud storage
+    const userInfo = await getUserInfo();
+    
+    setUploadProgress(0.5);
+    setUploadStatus(PlatformUtils.isWeb() 
+      ? 'Uploading to cloud and verifying...' 
+      : 'Storing locally and verifying...');
+
+    // Use PlatformStorageStrategy for platform-aware storage
+    const storageResult = await PlatformStorageStrategy.storeDocument(file, userInfo.userId);
+    
+    if (!storageResult.success) {
+      throw new Error('Storage failed');
+    }
 
     setUploadProgress(0.7);
-    setUploadStatus('Performing deep structure analysis...');
+    setUploadStatus('Running integrity checks...');
+
+    // Run integrity check on the stored document
+    const integrityResult = await DocumentProcessor.verifyFileIntegrity(storageResult.document);
+    
+    // Update document with integrity check results
+    storageResult.document.integrityCheck = {
+      timestamp: integrityResult.timestamp,
+      status: integrityResult.overallStatus,
+      lastChecked: new Date().toISOString()
+    };
+    await DocumentProcessor.updateDocumentMetadata(storageResult.document);
+
+    setUploadProgress(0.8);
+    setUploadStatus('Analyzing document structure...');
 
     let structureAnalysis = null;
     try {
-      const extractionResult = await DocumentProcessor.extractDocumentText(result.document);
-      structureAnalysis = await DocumentProcessor.analyzeDocumentStructure(extractionResult.text, result.document);
+      const extractionResult = await DocumentProcessor.extractDocumentText(storageResult.document);
+      structureAnalysis = await DocumentProcessor.analyzeDocumentStructureIntelligently(
+        extractionResult.text, 
+        storageResult.document
+      );
     } catch (error) {
       console.warn('Structure analysis failed:', error);
     }
 
     await loadDocuments();
-    setIntegrityResult(result.integrityResult);
+    setIntegrityResult(integrityResult);
 
     setUploadProgress(0.9);
-    setUploadStatus('Structure analysis complete');
     
-    // NEW: Show cloud backup status
-    if (result.document.cloudinarySyncStatus === 'uploading') {
-      setCloudSyncStatus('syncing');
-      setUploadStatus('Uploading complete! Cloud backup in progress...');
-    } else if (result.document.cloudinarySyncStatus === 'synced') {
-      setCloudSyncStatus('completed');
-      setUploadStatus('Upload and cloud backup completed!');
-    } else if (result.document.cloudinarySyncStatus === 'failed') {
-      setCloudSyncStatus('failed');
-      setUploadStatus('Upload complete. Cloud backup will retry automatically.');
+    // Show appropriate status based on platform and sync status
+    if (PlatformUtils.isWeb()) {
+      if (storageResult.document.cloudinarySyncStatus === 'synced') {
+        setUploadStatus('Upload and cloud backup completed!');
+        setCloudSyncStatus('completed');
+      } else {
+        setUploadStatus('Upload complete. Cloud backup in progress...');
+        setCloudSyncStatus('syncing');
+      }
+    } else {
+      if (storageResult.document.cloudinarySyncStatus === 'pending') {
+        setUploadStatus('File stored locally. Cloud backup will sync in background.');
+        setCloudSyncStatus('syncing');
+      } else if (storageResult.document.cloudinarySyncStatus === 'synced') {
+        setUploadStatus('Upload and cloud backup completed!');
+        setCloudSyncStatus('completed');
+      } else {
+        setUploadStatus('File stored locally. Cloud backup will retry automatically.');
+        setCloudSyncStatus('failed');
+      }
     }
 
+    // Generate academy preview
     let academyPreview = null;
     try {
-      academyPreview = await DocumentProcessor.previewAcademyInfo(result.document);
+      academyPreview = await DocumentProcessor.previewAcademyInfo(storageResult.document);
       if (structureAnalysis) {
         academyPreview.structureInsights = {
           organizationLevel: structureAnalysis.organizationLevel.level,
@@ -242,12 +310,14 @@ const handleDocumentUpload = async () => {
         };
       }
     } catch (error) {
-      console.warn('Could not generate enhanced academy preview:', error);
+      console.warn('Could not generate academy preview:', error);
     }
 
-    // NEW: Show session setup modal before proceeding
+    setUploadProgress(1.0);
+
+    // Show session setup modal
     setPendingDocument({
-      document: result.document,
+      document: storageResult.document,
       academyPreview,
       structureAnalysis
     });
@@ -255,12 +325,13 @@ const handleDocumentUpload = async () => {
     setUploading(false);
 
   } catch (error) {
-    console.error('Enhanced upload failed with error:', error);
-    const platformError = PlatformUtils.handlePlatformError(error, 'Enhanced Document Upload');
+    console.error('Upload failed:', error);
+    const platformError = PlatformUtils.handlePlatformError(error, 'Document Upload');
     showUploadError(platformError);
     setUploading(false);
     setUploadProgress(0);
     setUploadStatus('');
+    setCloudSyncStatus('idle');
   }
 };
 

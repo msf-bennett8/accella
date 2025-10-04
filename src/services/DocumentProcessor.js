@@ -5,6 +5,9 @@ import PlatformUtils from '../utils/PlatformUtils';
 import PDFProcessor from './PDFProcessor';
 import AIService from './AIService';
 import CloudinaryService from './CloudinaryService';
+import PlatformStorageStrategy from './PlatformStorageStrategy';
+import SessionExtractionStrategy from './SessionExtractionStrategy';
+import { db } from '../config/firebase.config';
 
 // Safe module variables - initialized to null
 let DocumentPicker = null;
@@ -225,13 +228,24 @@ async processTrainingPlan(documentId, options = {}) {
       ]);
     }
     
-    // FIXED: Create the training plan BEFORE trying to use it
+    // Create the training plan from document content
     console.log('Creating training plan from document content...');
     const trainingPlan = await this.parseTrainingPlanContent(text, document, options);
     
-    // Now we can safely use trainingPlan for structure analysis
+    // Analyze document structure with AI enhancement
     console.log('Analyzing document with AI enhancement...');
     trainingPlan.structureAnalysis = await this.analyzeDocumentStructureIntelligently(text, document);
+    
+    // Extract sessions using platform-aware strategy
+    console.log('Extracting sessions using platform-aware strategy...');
+      try {
+        const sessions = await SessionExtractionStrategy.extractSessions(documentId);
+        trainingPlan.sessions = sessions;
+        console.log(`Extracted ${sessions?.length || 0} sessions`);
+      } catch (sessionError) {
+        console.warn('Session extraction failed:', sessionError);
+        trainingPlan.sessions = [];
+      }
     
     // Save the training plan
     console.log('Saving training plan...');
@@ -642,19 +656,17 @@ async repairDocumentIntegrity(documentId) {
 
   // Platform-agnostic document storage
   async storeDocument(file) {
-    try {
-      await this.ensureInitialized();
-      
-      return await PlatformUtils.executePlatformSpecific(
-        () => this._storeDocumentWeb(file),
-        () => this._storeDocumentMobile(file)
-      );
-    } catch (error) {
-      const platformError = PlatformUtils.handlePlatformError(error, 'Document Storage');
-      console.error('Document storage error:', platformError);
-      throw platformError;
-    }
+  try {
+    await this.ensureInitialized();
+    
+    const userInfo = await this.getUserInfo();
+    const userId = userInfo.username || userInfo.firebaseUid || 'anonymous';
+    
+    return await PlatformStorageStrategy.storeDocument(file, userId);
+  } catch (error) {
+    throw PlatformUtils.handlePlatformError(error, 'Document Storage');
   }
+}
 
   // Cloudinary
 
@@ -3443,7 +3455,7 @@ async previewAcademyInfo(document) {
     const extractionResult = await this.extractDocumentText(document);
     const text = extractionResult.text;
     
-    return {
+    const preview = {
       academyName: this.extractAcademyNameFromText(text),
       weeksCount: this.extractWeeksCount(text),
       sessionsCount: this.extractSessionsCount(text),
@@ -3451,8 +3463,29 @@ async previewAcademyInfo(document) {
       sport: this.extractSportFromText(text),
       ageGroup: this.extractAgeGroupFromText(text)
     };
+    
+    // Try to add structure insights if available
+    try {
+      const structureAnalysis = await this.analyzeDocumentStructureIntelligently(text, document);
+      
+      if (structureAnalysis && structureAnalysis.organizationLevel) {
+        preview.structureInsights = {
+          organizationLevel: structureAnalysis.organizationLevel.level || 'basic_structure',
+          totalWeeks: structureAnalysis.weekStructure?.totalWeeks || 0,
+          totalDays: structureAnalysis.dayStructure?.totalDays || 0,
+          hasDurations: structureAnalysis.durationAnalysis?.hasDurationInfo || false,
+          confidence: structureAnalysis.confidence || 0.5
+        };
+      }
+    } catch (structError) {
+      console.warn('Structure analysis failed for preview:', structError.message);
+      // Preview will still work without structure insights
+    }
+    
+    return preview;
   } catch (error) {
     console.error('Academy info preview failed:', error);
+    // Return default preview instead of throwing
     return {
       academyName: 'Training Academy',
       weeksCount: 12,
@@ -3647,50 +3680,277 @@ getDocumentFormat(document) {
   return 'unknown';
 }
 
-// ADD this entirely new method
-async extractDocumentText(document) {
-  const format = this.getDocumentFormat(document);
+async extractTextFromBuffer(buffer, format) {
+  const tempDocument = {
+    type: this.getMimeTypeFromFormat(format),
+    buffer: buffer
+  };
   
+  switch (format) {
+    case 'word':
+      return await this.extractWordTextFromBuffer(buffer);
+    case 'excel':
+      return await this.extractExcelTextFromBuffer(buffer);
+    case 'csv':
+    case 'text':
+      return new TextDecoder('utf-8').decode(buffer);
+    case 'pdf':
+      return await this.extractPDFTextFromBuffer(buffer);
+    default:
+      throw new Error(`Unsupported format: ${format}`);
+  }
+}
+
+async extractTextFromLocalSource(document, format) {
+  switch (format) {
+    case 'word':
+      return await this.extractWordTextUnified(document);
+    case 'excel':
+      return await this.extractExcelTextUnified(document);
+    case 'csv':
+      return await this.extractCSVTextUnified(document);
+    case 'text':
+      return await this.extractTextFileUnified(document);
+    case 'pdf':
+      return await this.extractPDFTextUnified(document);
+    default:
+      throw new Error(`Unsupported format: ${format}`);
+  }
+}
+
+getMimeTypeFromFormat(format) {
+  const mimeTypes = {
+    word: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    excel: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    csv: 'text/csv',
+    text: 'text/plain',
+    pdf: 'application/pdf'
+  };
+  return mimeTypes[format] || 'application/octet-stream';
+}
+
+// Extract text from buffer (for web local storage)
+async extractTextFromBuffer(buffer, format) {
   try {
-    let extractedText = '';
-    
     switch (format) {
       case 'word':
-        extractedText = await this.extractWordTextUnified(document);
-        break;
+        return await this.extractWordTextFromBuffer(buffer);
       case 'excel':
-        extractedText = await this.extractExcelTextUnified(document);
-        break;
+        return await this.extractExcelTextFromBuffer(buffer);
       case 'csv':
-        extractedText = await this.extractCSVTextUnified(document);
-        break;
       case 'text':
-        extractedText = await this.extractTextFileUnified(document);
-        break;
+        const decoder = new TextDecoder('utf-8');
+        return decoder.decode(buffer);
       case 'pdf':
-        extractedText = await this.extractPDFTextUnified(document);
-        break;
+        return await this.extractPDFTextFromBuffer(buffer);
       default:
-        throw PlatformUtils.createError(`Unsupported format: ${format}`);
+        throw new Error(`Unsupported format: ${format}`);
+    }
+  } catch (error) {
+    console.error('Buffer text extraction failed:', error);
+    throw error;
+  }
+}
+
+async extractWordTextFromBuffer(buffer) {
+  if (!mammoth) {
+    throw new Error('Mammoth library not available for Word processing');
+  }
+  
+  try {
+    const result = await mammoth.extractRawText({ 
+      arrayBuffer: buffer.buffer || buffer 
+    });
+    
+    if (!result.value || result.value.trim().length === 0) {
+      throw new Error('No text content found in Word document');
+    }
+    
+    return result.value
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .trim();
+  } catch (error) {
+    console.error('Word buffer extraction failed:', error);
+    throw error;
+  }
+}
+
+async extractExcelTextFromBuffer(buffer) {
+  if (!XLSX) {
+    throw new Error('XLSX library not available for Excel processing');
+  }
+  
+  try {
+    const workbook = XLSX.read(buffer, { 
+      type: 'array',
+      cellText: true,
+      raw: false
+    });
+    
+    let text = '';
+    workbook.SheetNames.forEach((sheetName) => {
+      const worksheet = workbook.Sheets[sheetName];
+      const data = XLSX.utils.sheet_to_json(worksheet, { 
+        header: 1,
+        defval: '',
+        raw: false
+      });
+      
+      text += `Sheet: ${sheetName}\n`;
+      data.forEach((row) => {
+        if (row && row.length > 0) {
+          const rowText = row.join(' | ');
+          if (rowText.trim()) {
+            text += `${rowText}\n`;
+          }
+        }
+      });
+      text += '\n';
+    });
+    
+    return text.trim();
+  } catch (error) {
+    console.error('Excel buffer extraction failed:', error);
+    throw error;
+  }
+}
+
+async extractPDFTextFromBuffer(buffer) {
+  try {
+    const pdfProcessor = initializePDFProcessor();
+    if (!pdfProcessor) {
+      throw new Error('PDF processing not available on this platform');
+    }
+    
+    // Create a temporary document object for PDF processor
+    const tempDoc = {
+      webFileData: Array.from(new Uint8Array(buffer)),
+      type: 'application/pdf'
+    };
+    
+    return await pdfProcessor.extractTextFromPDF(tempDoc);
+  } catch (error) {
+    console.error('PDF buffer extraction failed:', error);
+    throw error;
+  }
+}
+
+// Cache extracted text in Firestore to avoid re-downloading
+// Cache extracted text in Firestore to avoid re-downloading
+async cacheExtractedText(documentId, extractedText, metadata) {
+  try {
+    if (Platform.OS === 'web') {
+      const { doc, setDoc, getFirestore } = require('firebase/firestore');
+      const firestore = db || getFirestore(); // Use imported db or get it
+      
+      await setDoc(doc(firestore, 'extractedTexts', documentId), {
+        documentId,
+        text: extractedText.substring(0, 900000), // Stay under 1MB limit
+        textLength: extractedText.length,
+        metadata,
+        cachedAt: new Date().toISOString(),
+        platform: 'web'
+      });
+      
+      console.log('✅ Extracted text cached in Firestore');
+    }
+  } catch (error) {
+    console.warn('⚠️ Text caching failed (non-critical):', error.message);
+  }
+}
+
+// Get cached extracted text from Firestore
+async getCachedExtractedText(documentId) {
+  try {
+    if (Platform.OS === 'web') {
+      const { doc, getDoc, getFirestore } = require('firebase/firestore');
+      const firestore = db || getFirestore();
+      
+      const docSnap = await getDoc(doc(firestore, 'extractedTexts', documentId));
+      
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        console.log('✅ Using cached extracted text from Firestore');
+        return {
+          text: data.text,
+          metadata: data.metadata,
+          fromCache: true
+        };
+      }
+    }
+    return null;
+  } catch (error) {
+    console.warn('⚠️ Could not retrieve cached text:', error.message);
+    return null;
+  }
+}
+
+// ADD this entirely new method
+async extractDocumentText(document) {
+  try {
+    // PRIORITY 1: Check Firestore cache first (web only)
+    if (Platform.OS === 'web') {
+      const cached = await this.getCachedExtractedText(document.id);
+      if (cached) {
+        return cached;
+      }
+    }
+    
+    const format = this.getDocumentFormat(document);
+    let extractedText = '';
+    
+    // PRIORITY 2: Use locally stored file data (if available)
+    if (Platform.OS === 'web' && document.webFileData) {
+      console.log('Using locally stored web file data');
+      const buffer = new Uint8Array(document.webFileData);
+      extractedText = await this.extractTextFromBuffer(buffer, format);
+    } 
+    // PRIORITY 3: Use mobile local path
+    else if (document.localPath) {
+      console.log('Using mobile local file');
+      extractedText = await this.extractTextFromLocalSource(document, format);
+    } 
+    // PRIORITY 4: Download from Cloudinary
+    else if (document.cloudinaryPublicId) {
+      console.log('Downloading from Cloudinary (local data unavailable)');
+      
+      // Small delay to ensure Cloudinary has processed the file
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      const fileData = await CloudinaryService.downloadDocument(
+        document.cloudinaryPublicId
+      );
+      const buffer = new Uint8Array(fileData.data);
+      extractedText = await this.extractTextFromBuffer(buffer, format);
+    } 
+    else {
+      throw new Error('No accessible document source found');
     }
     
     if (!extractedText || extractedText.trim().length === 0) {
-      throw PlatformUtils.createError('No text content found in document');
+      throw new Error('No text content found in document');
     }
     
-    return {
-      text: extractedText,
-      format,
-      metadata: {
-        originalFormat: format,
-        extractedLength: extractedText.length,
-        processingMethod: this.getProcessingMethod(format),
-        timestamp: new Date().toISOString()
-      }
+    const metadata = {
+      originalFormat: format,
+      extractedLength: extractedText.length,
+      processingMethod: this.getProcessingMethod(format),
+      timestamp: new Date().toISOString(),
+      platform: Platform.OS,
+      source: document.webFileData ? 'local_web' : 
+              document.localPath ? 'local_mobile' : 'cloudinary'
     };
     
+    // Cache for web platform
+    if (Platform.OS === 'web') {
+      this.cacheExtractedText(document.id, extractedText, metadata)
+        .catch(err => console.warn('Cache failed:', err));
+    }
+    
+    return { text: extractedText, format, metadata };
   } catch (error) {
-    console.error(`Text extraction failed for ${format}:`, error);
+    console.error('Document text extraction failed:', error);
     throw error;
   }
 }

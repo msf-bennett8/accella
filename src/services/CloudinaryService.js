@@ -8,7 +8,7 @@ const UPLOAD_PRESET = 'accella_foundation';
 
 class CloudinaryService {
   constructor() {
-    this.uploadUrl = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/upload`;  // FIXED
+    this.uploadUrl = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/upload`;
   }
 
   /**
@@ -69,95 +69,131 @@ class CloudinaryService {
   }
 
   /**
-   * Upload document to Cloudinary
-   * @param {string} fileUri - Local file URI
-   * @param {string} fileName - Original file name
-   * @param {string} userId - User ID for folder organization
-   * @returns {Promise<Object>} Upload result with URL and metadata
+   * Helper Method for async upload
    */
-async uploadDocument(fileUri, fileName, userId) {
-  try {
-    console.log('Starting Cloudinary upload:', fileName);
-    
-    let base64Data;
-    
-    // Platform-specific file reading
-    if (Platform.OS === 'web') {
-      // WEB: Use fetch to get the blob, then convert to base64
-      try {
-        const response = await fetch(fileUri);
-        const blob = await response.blob();
-        base64Data = await this.blobToBase64(blob);
-      } catch (error) {
-        throw new Error(`Could not read file on web: ${error.message}`);
-      }
-    } else {
-      // NATIVE: Use FileSystem
-      base64Data = await FileSystem.readAsStringAsync(fileUri, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
+  async uploadDocumentAsync(file, userId) {
+    try {
+      return await this.uploadDocument(file.uri || file.path, file.name, userId);
+    } catch (error) {
+      console.warn('Async upload failed:', error);
+      throw error;
     }
-
-    // Sanitize the filename - remove all special characters
-    const sanitizedFileName = fileName
-      .replace(/\s+/g, '_')           // Replace spaces with underscores
-      .replace(/[^a-zA-Z0-9._-]/g, '') // Remove special chars except . _ -
-      .replace(/\.+/g, '.')           // Replace multiple dots with single dot
-      .substring(0, 200);             // Limit length
-    
-    // Create public_id WITH folder structure included (no separate folder param)
-    const timestamp = Date.now();
-    const publicIdWithPath = `users/${userId}/documents/${timestamp}_${sanitizedFileName}`;
-
-    const formData = new FormData();
-    formData.append('file', `data:application/octet-stream;base64,${base64Data}`);
-    formData.append('upload_preset', UPLOAD_PRESET);
-    formData.append('public_id', publicIdWithPath);  // ✅ Folder path IN the public_id
-    formData.append('resource_type', 'raw');
-    // DON'T add folder parameter - it conflicts with public_id
-    
-    const response = await axios.post(this.uploadUrl, formData, {
-      headers: { 
-        'Content-Type': 'multipart/form-data',
-        'Accept': 'application/json'
-      },
-      timeout: 60000,
-      onUploadProgress: (progressEvent) => {
-        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-        console.log('Cloudinary upload progress:', percentCompleted + '%');
-      }
-    });
-
-    console.log('Cloudinary upload successful:', response.data.public_id);
-
-    return {
-      success: true,
-      url: response.data.secure_url,
-      publicId: response.data.public_id,
-      originalName: fileName,
-      cloudinaryName: response.data.public_id.split('/').pop(),
-      size: response.data.bytes,
-      format: response.data.format
-    };
-  } catch (error) {
-    console.error('Cloudinary upload failed:', error);
-    throw this.handleUploadError(error);
   }
-}
 
-// Helper method for web: convert Blob to base64
-blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      // Remove the data URL prefix (data:*/*;base64,)
-      const base64String = reader.result.split(',')[1];
-      resolve(base64String);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
+  /**
+   * Upload document to Cloudinary with size optimization warnings
+   */
+  async uploadDocument(fileUri, fileName, userId) {
+    try {
+      console.log('Starting Cloudinary upload:', fileName);
+      
+      let base64Data;
+      let fileSize = 0;
+      
+      // Platform-specific file reading
+      if (Platform.OS === 'web') {
+        try {
+          const response = await fetch(fileUri);
+          const blob = await response.blob();
+          fileSize = blob.size;
+          
+          // Warn about large files
+          if (fileSize > 5 * 1024 * 1024) {
+            console.warn(`⚠️ Large file detected (${this.formatFileSize(fileSize)}). Consider removing images for faster processing.`);
+          }
+          
+          base64Data = await this.blobToBase64(blob);
+        } catch (error) {
+          throw new Error(`Could not read file on web: ${error.message}`);
+        }
+      } else {
+        // Native: Get file info first
+        try {
+          const fileInfo = await FileSystem.getInfoAsync(fileUri);
+          fileSize = fileInfo.size || 0;
+          
+          if (fileSize > 5 * 1024 * 1024) {
+            console.warn(`⚠️ Large file detected (${this.formatFileSize(fileSize)}). Consider removing images for faster processing.`);
+          }
+        } catch (error) {
+          console.warn('Could not get file info:', error.message);
+        }
+        
+        base64Data = await FileSystem.readAsStringAsync(fileUri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+      }
+
+      // Sanitize filename
+      const sanitizedFileName = fileName
+        .replace(/\s+/g, '_')
+        .replace(/[^a-zA-Z0-9._-]/g, '')
+        .replace(/\.+/g, '.')
+        .substring(0, 200);
+      
+      const timestamp = Date.now();
+      const publicIdWithPath = `users/${userId}/documents/${timestamp}_${sanitizedFileName}`;
+
+      const formData = new FormData();
+      formData.append('file', `data:application/octet-stream;base64,${base64Data}`);
+      formData.append('upload_preset', UPLOAD_PRESET);
+      formData.append('public_id', publicIdWithPath);
+      formData.append('resource_type', 'raw');
+      
+      const response = await axios.post(this.uploadUrl, formData, {
+        headers: { 
+          'Content-Type': 'multipart/form-data',
+          'Accept': 'application/json'
+        },
+        timeout: 120000, // Increased to 2 minutes for large files
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          console.log('Cloudinary upload progress:', percentCompleted + '%');
+        }
+      });
+
+      console.log('Cloudinary upload successful:', response.data.public_id);
+
+      return {
+        success: true,
+        url: response.data.secure_url,
+        publicId: response.data.public_id,
+        originalName: fileName,
+        cloudinaryName: response.data.public_id.split('/').pop(),
+        size: response.data.bytes,
+        format: response.data.format,
+        isLargeFile: fileSize > 5 * 1024 * 1024
+      };
+    } catch (error) {
+      console.error('Cloudinary upload failed:', error);
+      throw this.handleUploadError(error);
+    }
+  }
+
+  /**
+   * Helper: Convert Blob to base64
+   */
+  blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64String = reader.result.split(',')[1];
+        resolve(base64String);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  /**
+   * Format file size for display
+   */
+  formatFileSize(bytes) {
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    if (bytes === 0) return '0 Bytes';
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
+  }
 
   /**
    * Get resource type based on file extension
@@ -170,7 +206,7 @@ blobToBase64(blob) {
     
     if (imageExtensions.includes(extension)) return 'image';
     if (videoExtensions.includes(extension)) return 'video';
-    return 'auto'; // For documents (PDF, DOCX, etc.)
+    return 'auto';
   }
 
   /**
@@ -204,7 +240,7 @@ blobToBase64(blob) {
       transformations += `,h_${height}`;
     }
 
-    return `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/${transformations}/${publicId}`;  // FIXED
+    return `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/${transformations}/${publicId}`;
   }
 
   /**
@@ -212,7 +248,8 @@ blobToBase64(blob) {
    */
   handleUploadError(error) {
     if (error.response) {
-      return new Error(`Cloudinary error: ${error.response.data.error.message}`);
+      const errorMsg = error.response.data?.error?.message || 'Unknown error';
+      return new Error(`Cloudinary error: ${errorMsg}`);
     } else if (error.request) {
       return new Error('Network error: Please check your internet connection');
     } else {
@@ -221,15 +258,26 @@ blobToBase64(blob) {
   }
 
   /**
-   * Validate file before upload
+   * Validate file before upload with detailed feedback
    */
   validateFile(fileSize, fileName) {
-    const maxSize = 10 * 1024 * 1024; // 10MB for free tier
+    const maxSize = 10 * 1024 * 1024; // 10MB
+    const optimalSize = 3 * 1024 * 1024; // 3MB optimal
     
     if (fileSize > maxSize) {
       return {
         valid: false,
-        error: 'File size exceeds 10MB limit'
+        error: 'File size exceeds 10MB limit',
+        suggestion: 'Remove images from the document to reduce file size'
+      };
+    }
+
+    // Warning for large but acceptable files
+    if (fileSize > optimalSize) {
+      return {
+        valid: true,
+        warning: `File is large (${this.formatFileSize(fileSize)}). Consider removing images for faster processing.`,
+        isLarge: true
       };
     }
 
@@ -239,11 +287,48 @@ blobToBase64(blob) {
     if (!allowedExtensions.includes(extension)) {
       return {
         valid: false,
-        error: `File type .${extension} is not supported`
+        error: `File type .${extension} is not supported`,
+        suggestion: 'Use PDF, Word, Excel, or text files'
       };
     }
 
-    return { valid: true };
+    return { 
+      valid: true,
+      isOptimal: fileSize <= optimalSize
+    };
+  }
+
+  /**
+   * Get upload recommendations based on file characteristics
+   */
+  getUploadRecommendations(fileSize, fileName) {
+    const validation = this.validateFile(fileSize, fileName);
+    
+    if (!validation.valid) {
+      return {
+        canUpload: false,
+        message: validation.error,
+        suggestions: [validation.suggestion]
+      };
+    }
+
+    if (validation.isLarge) {
+      return {
+        canUpload: true,
+        message: validation.warning,
+        suggestions: [
+          'Images will be ignored during text extraction',
+          'Remove images to reduce upload time',
+          'Optimal file size is under 3MB'
+        ]
+      };
+    }
+
+    return {
+      canUpload: true,
+      message: 'File is optimal for processing',
+      suggestions: []
+    };
   }
 }
 
